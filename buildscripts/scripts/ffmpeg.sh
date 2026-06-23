@@ -31,6 +31,7 @@ cpuflags=
 	--disable-static --enable-shared --enable-{gpl,version3} \
 	--disable-{stripping,doc,programs} \
 	--disable-{muxers,encoders,devices,filters} \
+	--enable-muxer=spdif \
 	--disable-v4l2-m2m
 
 make -j$cores
