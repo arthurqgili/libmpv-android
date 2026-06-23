@@ -1,0 +1,179 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index f483ccc..1eaec83 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -39,6 +39,8 @@ struct priv {
+     jint channel_config;
+     jint format;
+     jint size;
++    bool raw_spdif; /* F11: spdif fed to a RAW per-codec AudioTrack; unwrap IEC61937 on write */
++    int spdif_rate_mul; /* F11: ao->samplerate / AudioTrack rate (4 for E-AC3/DTS-HD RAW, else 1) */
+ 
+     jobject timestamp;
+     int64_t timestamp_fetched;
+@@ -187,6 +189,10 @@ static struct JNIAudioFormat {
+     jint ENCODING_PCM_16BIT;
+     jint ENCODING_PCM_FLOAT;
+     jint ENCODING_IEC61937;
++    jint ENCODING_AC3;
++    jint ENCODING_E_AC3;
++    jint ENCODING_DTS;
++    jint ENCODING_DTS_HD;
+     jint CHANNEL_OUT_MONO;
+     jint CHANNEL_OUT_STEREO;
+     jint CHANNEL_OUT_FRONT_CENTER;
+@@ -202,6 +208,10 @@ static const struct MPJniField AudioFormat_mapping[] = {
+     {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
+     {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
+     {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
++    {"ENCODING_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_AC3), 0},
++    {"ENCODING_E_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_E_AC3), 0},
++    {"ENCODING_DTS", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS), 0},
++    {"ENCODING_DTS_HD", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS_HD), 0},
+     {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
+     {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
+     {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
+@@ -417,6 +427,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+      */
+     if (p->timestamp_set) {
+         pos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
++        pos *= p->spdif_rate_mul; // F11: AudioTrack-rate frames -> core (ao->samplerate) units
+         uint32_t fpos = pos;
+         int64_t time = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+         if (time == 0)
+@@ -428,6 +439,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+         //MP_VERBOSE(ao, "position = %u via getTimestamp (state = %d / fpos= %u / time= %"PRId64")\n", pos, state, fpos, time);
+     } else {
+         pos = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++        pos *= p->spdif_rate_mul; // F11: AudioTrack-rate frames -> core (ao->samplerate) units
+         //MP_VERBOSE(ao, "playbackHeadPosition = %u (reset_pending=%d)\n", pos, p->reset_pending);
+     }
+ 
+@@ -486,6 +498,34 @@ static double AudioTrack_getLatency(struct ao *ao)
+     return MPCLAMP(delay, 0.0, 2.0);
+ }
+ 
++// F11: extract the bare compressed frame from an IEC 61937 data-burst, in place. ad_spdif feeds us
++// the burst (PCM-shaped) even for RAW passthrough; ENCODING_AC3/E_AC3/DTS want the naked frame.
++// Burst layout: 4x 16-bit preamble (Pa=0xF872, Pb=0x4E1F, Pc=type, Pd=length-in-bits), then the
++// payload (16-bit byte-swapped by spdifenc), then zero padding to the repetition period.
++// Returns the payload length in bytes, 0 if the burst carries none, or -1 if no valid sync.
++static int iec61937_unwrap(struct ao *ao, void *buf, int len)
++{
++    if (len < 8)
++        return -1;
++    uint16_t *w = buf;
++    if (w[0] != 0xF872 || w[1] != 0x4E1F) {
++        MP_VERBOSE(ao, "iec61937: no sync (w0=%04x w1=%04x)\n", w[0], w[1]);
++        return -1;
++    }
++    int payload_bytes = (w[3] + 7) / 8;
++    if (payload_bytes <= 0)
++        return 0;
++    if (payload_bytes > len - 8)
++        payload_bytes = len - 8;
++    uint8_t *payload = (uint8_t *)buf + 8;
++    // spdifenc emits the payload byte-swapped (16-bit); restore the codec's native byte order.
++    for (int i = 0; i + 1 < payload_bytes; i += 2) {
++        uint8_t t = payload[i]; payload[i] = payload[i + 1]; payload[i + 1] = t;
++    }
++    memmove(buf, payload, payload_bytes);
++    return payload_bytes;
++}
++
+ static int AudioTrack_write(struct ao *ao, int len)
+ {
+     struct priv *p = ao->priv;
+@@ -495,7 +535,20 @@ static int AudioTrack_write(struct ao *ao, int len)
+     void *buf = p->chunk;
+ 
+     jint ret;
+-    if (p->format == AudioFormat.ENCODING_IEC61937) {
++    if (p->raw_spdif) {
++        // Unwrap the IEC61937 burst to the bare frame and write it to the RAW AudioTrack.
++        int plen = iec61937_unwrap(ao, buf, len);
++        if (plen <= 0)
++            return len; // empty/padding-only burst — treat the whole input as consumed
++        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
++        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        MP_JNI_LOCAL_FREEP(&bbuf);
++        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, plen, AudioTrack.WRITE_BLOCKING);
++        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        // Report the whole burst as consumed so the core's sample accounting (and the A/V clock,
++        // which is driven by the AudioTrack playback head) stays aligned with IEC61937 timing.
++        return ret >= 0 ? len : ret;
++    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
+         (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
+         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+         ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
+@@ -658,11 +711,29 @@ static int init(struct ao *ao)
+         return -1;
+ 
+     if (af_fmt_is_spdif(ao->format)) {
+-        p->format = AudioFormat.ENCODING_IEC61937;
+-        if (!p->format || !AudioTrack.writeShortV23) {
++        // F11 (this fork): many Android TV devices (Amlogic) route ENCODING_IEC61937 to a PCM
++        // fast-mixer output instead of the HDMI passthrough path, so the AudioTrack opens but never
++        // bitstreams (video then freezes with video-sync=audio). Prefer RAW per-codec encodings
++        // (ENCODING_AC3/E_AC3/DTS) — the path ExoPlayer/Kodi use — and unwrap the IEC61937 burst
++        // produced by ad_spdif into the bare frame at write time (see AudioTrack_write).
++        switch (ao->format) {
++        case AF_FORMAT_S_AC3:   p->format = AudioFormat.ENCODING_AC3;    break;
++        case AF_FORMAT_S_EAC3:  p->format = AudioFormat.ENCODING_E_AC3;  break;
++        case AF_FORMAT_S_DTS:   p->format = AudioFormat.ENCODING_DTS;    break;
++        case AF_FORMAT_S_DTSHD: p->format = AudioFormat.ENCODING_DTS_HD; break;
++        default:                p->format = 0;                          break;
++        }
++        p->raw_spdif = p->format != 0;
++        // Fall back to the IEC61937 wrapper if the RAW encoding isn't available for this codec.
++        if (!p->raw_spdif)
++            p->format = AudioFormat.ENCODING_IEC61937;
++        if (!p->format ||
++            (p->raw_spdif && !AudioTrack.writeBufferV21) ||
++            (!p->raw_spdif && !AudioTrack.writeShortV23)) {
+             MP_ERR(ao, "spdif passthrough not supported by API\n");
+             return -1;
+         }
++        MP_VERBOSE(ao, "spdif passthrough: encoding=%d raw=%d\n", p->format, p->raw_spdif);
+     } else if (ao->format == AF_FORMAT_U8) {
+         p->format = AudioFormat.ENCODING_PCM_8BIT;
+     } else if (p->cfg_pcm_float && af_fmt_is_float(ao->format)) {
+@@ -673,7 +744,8 @@ static int init(struct ao *ao)
+         p->format = AudioFormat.ENCODING_PCM_16BIT;
+     }
+ 
+-    if (AudioTrack.getNativeOutputSampleRate) {
++    // Passthrough must not be resampled, so skip the native-rate clamp for spdif.
++    if (AudioTrack.getNativeOutputSampleRate && !af_fmt_is_spdif(ao->format)) {
+         jint samplerate = MP_JNI_CALL_STATIC_INT(
+             AudioTrack.clazz,
+             AudioTrack.getNativeOutputSampleRate,
+@@ -685,6 +757,18 @@ static int init(struct ao *ao)
+         }
+     }
+     p->samplerate = ao->samplerate;
++    p->spdif_rate_mul = 1;
++    // F11: ad_spdif inflates the E-AC3/DTS-HD rate ~4x for the IEC61937 burst (192000), but the RAW
++    // AudioTrack (ENCODING_E_AC3/DTS_HD) only opens at the base codec rate (48000 — device-verified:
++    // 192000 fails with AudioFlinger status -38). Open the track at the base rate and scale the
++    // playback-head position back up by the same factor so the core's clock (written_frames is in
++    // ao->samplerate units) stays consistent.
++    if (p->raw_spdif && (ao->format == AF_FORMAT_S_EAC3 || ao->format == AF_FORMAT_S_DTSHD)) {
++        p->spdif_rate_mul = 4;
++        p->samplerate = ao->samplerate / 4;
++        MP_VERBOSE(ao, "raw spdif: AudioTrack rate=%d (core rate=%d, mul=%d)\n",
++                   p->samplerate, ao->samplerate, p->spdif_rate_mul);
++    }
+ 
+     /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
+     static const struct mp_chmap layouts[] = {
+@@ -710,7 +794,8 @@ static int init(struct ao *ao)
+         AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
+     };
+     static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
+-    if (p->format == AudioFormat.ENCODING_IEC61937) {
++    if (af_fmt_is_spdif(ao->format)) {
++        // All spdif passthrough (IEC61937 wrapper or RAW per-codec) opens a stereo-framed track.
+         p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
+     } else {
+         struct mp_chmap_sel sel = {0};
