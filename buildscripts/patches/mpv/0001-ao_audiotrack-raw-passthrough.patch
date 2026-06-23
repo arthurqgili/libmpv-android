@@ -1,17 +1,22 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index f483ccc..1eaec83 100644
+index f483ccc..132fd60 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -39,6 +39,8 @@ struct priv {
+@@ -39,6 +39,13 @@ struct priv {
      jint channel_config;
      jint format;
      jint size;
 +    bool raw_spdif; /* F11: spdif fed to a RAW per-codec AudioTrack; unwrap IEC61937 on write */
 +    int spdif_rate_mul; /* F11: ao->samplerate / AudioTrack rate (4 for E-AC3/DTS-HD RAW, else 1) */
++    uint8_t *spdif_acc;   /* F11: IEC61937 burst reassembly (chunks aren't burst-aligned) */
++    int spdif_acc_len;
++    int spdif_acc_cap;
++    uint8_t *spdif_out;   /* F11: unwrapped bare frames to hand to the RAW AudioTrack */
++    jobject spdif_out_bbuf;
  
      jobject timestamp;
      int64_t timestamp_fetched;
-@@ -187,6 +189,10 @@ static struct JNIAudioFormat {
+@@ -187,6 +194,10 @@ static struct JNIAudioFormat {
      jint ENCODING_PCM_16BIT;
      jint ENCODING_PCM_FLOAT;
      jint ENCODING_IEC61937;
@@ -22,7 +27,7 @@ index f483ccc..1eaec83 100644
      jint CHANNEL_OUT_MONO;
      jint CHANNEL_OUT_STEREO;
      jint CHANNEL_OUT_FRONT_CENTER;
-@@ -202,6 +208,10 @@ static const struct MPJniField AudioFormat_mapping[] = {
+@@ -202,6 +213,10 @@ static const struct MPJniField AudioFormat_mapping[] = {
      {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
      {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
      {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
@@ -33,7 +38,7 @@ index f483ccc..1eaec83 100644
      {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
      {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
      {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
-@@ -417,6 +427,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -417,6 +432,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
       */
      if (p->timestamp_set) {
          pos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
@@ -41,7 +46,7 @@ index f483ccc..1eaec83 100644
          uint32_t fpos = pos;
          int64_t time = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
          if (time == 0)
-@@ -428,6 +439,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -428,6 +444,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
          //MP_VERBOSE(ao, "position = %u via getTimestamp (state = %d / fpos= %u / time= %"PRId64")\n", pos, state, fpos, time);
      } else {
          pos = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
@@ -49,64 +54,93 @@ index f483ccc..1eaec83 100644
          //MP_VERBOSE(ao, "playbackHeadPosition = %u (reset_pending=%d)\n", pos, p->reset_pending);
      }
  
-@@ -486,6 +498,34 @@ static double AudioTrack_getLatency(struct ao *ao)
+@@ -486,6 +503,49 @@ static double AudioTrack_getLatency(struct ao *ao)
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
-+// F11: extract the bare compressed frame from an IEC 61937 data-burst, in place. ad_spdif feeds us
-+// the burst (PCM-shaped) even for RAW passthrough; ENCODING_AC3/E_AC3/DTS want the naked frame.
-+// Burst layout: 4x 16-bit preamble (Pa=0xF872, Pb=0x4E1F, Pc=type, Pd=length-in-bits), then the
-+// payload (16-bit byte-swapped by spdifenc), then zero padding to the repetition period.
-+// Returns the payload length in bytes, 0 if the burst carries none, or -1 if no valid sync.
-+static int iec61937_unwrap(struct ao *ao, void *buf, int len)
++// F11: scan the accumulated IEC61937 stream (p->spdif_acc) for complete data-bursts and copy each
++// burst's bare frame into p->spdif_out, de-byte-swapped. ad_spdif feeds us IEC61937 bursts even in
++// RAW mode, and mpv's audio chunks are NOT burst-aligned, so we keep a carry across writes. Burst:
++// 4x 16-bit preamble (Pa=0xF872, Pb=0x4E1F, Pc, Pd=length-in-bits), payload, zero padding to the
++// repetition period. spdifenc emits 16-bit big-endian by default, so the sync arrives byte-swapped
++// (0x72F8/0x1F4E); we detect both orders and unswap the payload accordingly. Returns bytes in out.
++static int iec61937_extract(struct ao *ao)
 +{
-+    if (len < 8)
-+        return -1;
-+    uint16_t *w = buf;
-+    if (w[0] != 0xF872 || w[1] != 0x4E1F) {
-+        MP_VERBOSE(ao, "iec61937: no sync (w0=%04x w1=%04x)\n", w[0], w[1]);
-+        return -1;
++    struct priv *p = ao->priv;
++    uint8_t *a = p->spdif_acc;
++    int n = p->spdif_acc_len;
++    int out = 0;
++    int i = 0;
++    while (i + 8 <= n) {
++        uint16_t w0 = a[i] | (a[i + 1] << 8);
++        uint16_t w1 = a[i + 2] | (a[i + 3] << 8);
++        bool be = (w0 == 0x72F8 && w1 == 0x1F4E); // spdifenc big-endian (payload byte-swapped)
++        bool le = (w0 == 0xF872 && w1 == 0x4E1F); // little-endian (payload already native)
++        if (!be && !le) { i += 2; continue; }     // IEC61937 is 16-bit aligned → scan by words
++        uint16_t pd = a[i + 6] | (a[i + 7] << 8);
++        if (be) pd = (pd << 8) | (pd >> 8);
++        int payload = (pd + 7) / 8;
++        if (payload <= 0 || out + payload > p->spdif_acc_cap) { i += 2; continue; }
++        if (i + 8 + payload > n) break;           // burst not fully accumulated yet
++        uint8_t *src = a + i + 8;
++        if (be) {
++            for (int k = 0; k + 1 < payload; k += 2) {
++                p->spdif_out[out + k]     = src[k + 1];
++                p->spdif_out[out + k + 1] = src[k];
++            }
++            if (payload & 1) p->spdif_out[out + payload - 1] = src[payload - 1];
++        } else {
++            memcpy(p->spdif_out + out, src, payload);
++        }
++        out += payload;
++        i += 8 + payload; // padding (zeros) up to the next sync is skipped by the scan above
 +    }
-+    int payload_bytes = (w[3] + 7) / 8;
-+    if (payload_bytes <= 0)
-+        return 0;
-+    if (payload_bytes > len - 8)
-+        payload_bytes = len - 8;
-+    uint8_t *payload = (uint8_t *)buf + 8;
-+    // spdifenc emits the payload byte-swapped (16-bit); restore the codec's native byte order.
-+    for (int i = 0; i + 1 < payload_bytes; i += 2) {
-+        uint8_t t = payload[i]; payload[i] = payload[i + 1]; payload[i + 1] = t;
-+    }
-+    memmove(buf, payload, payload_bytes);
-+    return payload_bytes;
++    int rem = n - i;
++    memmove(a, a + i, rem);
++    p->spdif_acc_len = rem;
++    return out;
 +}
 +
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -495,7 +535,20 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -495,7 +555,25 @@ static int AudioTrack_write(struct ao *ao, int len)
      void *buf = p->chunk;
  
      jint ret;
 -    if (p->format == AudioFormat.ENCODING_IEC61937) {
 +    if (p->raw_spdif) {
-+        // Unwrap the IEC61937 burst to the bare frame and write it to the RAW AudioTrack.
-+        int plen = iec61937_unwrap(ao, buf, len);
-+        if (plen <= 0)
-+            return len; // empty/padding-only burst — treat the whole input as consumed
-+        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
-+        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-+        MP_JNI_LOCAL_FREEP(&bbuf);
-+        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, plen, AudioTrack.WRITE_BLOCKING);
-+        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-+        // Report the whole burst as consumed so the core's sample accounting (and the A/V clock,
-+        // which is driven by the AudioTrack playback head) stays aligned with IEC61937 timing.
-+        return ret >= 0 ? len : ret;
++        // Accumulate this (non-burst-aligned) chunk, then write every fully-reassembled frame.
++        if (p->spdif_acc_len + len > p->spdif_acc_cap)
++            p->spdif_acc_len = 0; // overflow / no sync found yet → drop stale data
++        if (len <= p->spdif_acc_cap - p->spdif_acc_len) {
++            memcpy(p->spdif_acc + p->spdif_acc_len, buf, len);
++            p->spdif_acc_len += len;
++        }
++        int out = iec61937_extract(ao);
++        if (out > 0) {
++            jobject bbuf = MP_JNI_CALL_OBJECT(p->spdif_out_bbuf, ByteBuffer.clear);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++            MP_JNI_LOCAL_FREEP(&bbuf);
++            ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->spdif_out_bbuf, out, AudioTrack.WRITE_BLOCKING);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        }
++        // Always consume the IEC61937 input; the core clock follows the AudioTrack playback head.
++        return len;
 +    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
          (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
          if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
          ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
-@@ -658,11 +711,29 @@ static int init(struct ao *ao)
+@@ -636,6 +714,8 @@ static void uninit(struct ao *ao)
+ 
+     MP_JNI_GLOBAL_FREEP(&p->bbuf);
+ 
++    MP_JNI_GLOBAL_FREEP(&p->spdif_out_bbuf); // F11 (spdif_acc/spdif_out are talloc'd under ao)
++
+     MP_JNI_GLOBAL_FREEP(&p->timestamp);
+ 
+     mp_cond_destroy(&p->wakeup);
+@@ -658,11 +738,29 @@ static int init(struct ao *ao)
          return -1;
  
      if (af_fmt_is_spdif(ao->format)) {
@@ -138,7 +172,7 @@ index f483ccc..1eaec83 100644
      } else if (ao->format == AF_FORMAT_U8) {
          p->format = AudioFormat.ENCODING_PCM_8BIT;
      } else if (p->cfg_pcm_float && af_fmt_is_float(ao->format)) {
-@@ -673,7 +744,8 @@ static int init(struct ao *ao)
+@@ -673,7 +771,8 @@ static int init(struct ao *ao)
          p->format = AudioFormat.ENCODING_PCM_16BIT;
      }
  
@@ -148,7 +182,7 @@ index f483ccc..1eaec83 100644
          jint samplerate = MP_JNI_CALL_STATIC_INT(
              AudioTrack.clazz,
              AudioTrack.getNativeOutputSampleRate,
-@@ -685,6 +757,18 @@ static int init(struct ao *ao)
+@@ -685,6 +784,18 @@ static int init(struct ao *ao)
          }
      }
      p->samplerate = ao->samplerate;
@@ -167,7 +201,7 @@ index f483ccc..1eaec83 100644
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -710,7 +794,8 @@ static int init(struct ao *ao)
+@@ -710,7 +821,8 @@ static int init(struct ao *ao)
          AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
      };
      static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
@@ -177,3 +211,21 @@ index f483ccc..1eaec83 100644
          p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
      } else {
          struct mp_chmap_sel sel = {0};
+@@ -759,6 +871,17 @@ static int init(struct ao *ao)
+     p->timestamp = (*env)->NewGlobalRef(env, timestamp);
+     MP_JNI_LOCAL_FREEP(&timestamp);
+ 
++    // F11: buffers for IEC61937 burst reassembly + the unwrapped output handed to the AudioTrack.
++    if (p->raw_spdif) {
++        p->spdif_acc_cap = 128 * 1024; // > largest burst (E-AC3 24KiB) + a chunk
++        p->spdif_acc = talloc_size(ao, p->spdif_acc_cap);
++        p->spdif_acc_len = 0;
++        p->spdif_out = talloc_size(ao, p->spdif_acc_cap);
++        jobject ob = (*env)->NewDirectByteBuffer(env, p->spdif_out, p->spdif_acc_cap);
++        p->spdif_out_bbuf = (*env)->NewGlobalRef(env, ob);
++        MP_JNI_LOCAL_FREEP(&ob);
++    }
++
+     // decide and create buffer of right type
+     if (p->format == AudioFormat.ENCODING_IEC61937) {
+         jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
