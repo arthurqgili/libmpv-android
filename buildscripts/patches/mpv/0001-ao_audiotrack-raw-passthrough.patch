@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index f483ccc..e56d2f4 100644
+index f483ccc..4b70490 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -21,6 +21,9 @@
@@ -12,7 +12,7 @@ index f483ccc..e56d2f4 100644
  #include "ao.h"
  #include "internal.h"
  #include "common/msg.h"
-@@ -39,6 +42,13 @@ struct priv {
+@@ -39,6 +42,14 @@ struct priv {
      jint channel_config;
      jint format;
      jint size;
@@ -23,10 +23,11 @@ index f483ccc..e56d2f4 100644
 +    int spdif_acc_cap;
 +    uint8_t *spdif_out;   /* F11: unwrapped bare frames to hand to the RAW AudioTrack */
 +    jobject spdif_out_bbuf;
++    int spdif_dbg;        /* F11: limit per-burst diagnostic logging */
  
      jobject timestamp;
      int64_t timestamp_fetched;
-@@ -187,6 +197,10 @@ static struct JNIAudioFormat {
+@@ -187,6 +198,10 @@ static struct JNIAudioFormat {
      jint ENCODING_PCM_16BIT;
      jint ENCODING_PCM_FLOAT;
      jint ENCODING_IEC61937;
@@ -37,7 +38,7 @@ index f483ccc..e56d2f4 100644
      jint CHANNEL_OUT_MONO;
      jint CHANNEL_OUT_STEREO;
      jint CHANNEL_OUT_FRONT_CENTER;
-@@ -202,6 +216,10 @@ static const struct MPJniField AudioFormat_mapping[] = {
+@@ -202,6 +217,10 @@ static const struct MPJniField AudioFormat_mapping[] = {
      {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
      {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
      {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
@@ -48,7 +49,7 @@ index f483ccc..e56d2f4 100644
      {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
      {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
      {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
-@@ -417,6 +435,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -417,6 +436,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
       */
      if (p->timestamp_set) {
          pos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
@@ -56,7 +57,7 @@ index f483ccc..e56d2f4 100644
          uint32_t fpos = pos;
          int64_t time = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
          if (time == 0)
-@@ -428,6 +447,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -428,6 +448,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
          //MP_VERBOSE(ao, "position = %u via getTimestamp (state = %d / fpos= %u / time= %"PRId64")\n", pos, state, fpos, time);
      } else {
          pos = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
@@ -64,7 +65,7 @@ index f483ccc..e56d2f4 100644
          //MP_VERBOSE(ao, "playbackHeadPosition = %u (reset_pending=%d)\n", pos, p->reset_pending);
      }
  
-@@ -486,6 +506,49 @@ static double AudioTrack_getLatency(struct ao *ao)
+@@ -486,6 +507,56 @@ static double AudioTrack_getLatency(struct ao *ao)
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
@@ -102,6 +103,13 @@ index f483ccc..e56d2f4 100644
 +        } else {
 +            memcpy(p->spdif_out + out, src, payload);
 +        }
++        if (p->spdif_dbg < 12) { // F11 diag: data_type (Pc&0x1f), sizes, and the unwrapped frame head
++            MP_INFO(ao, "iec burst#%d be=%d pc=%02x%02x pd=%d payload=%d frame=%02x %02x %02x %02x\n",
++                    p->spdif_dbg, be, a[i + 4], a[i + 5], pd, payload,
++                    p->spdif_out[out], p->spdif_out[out + 1],
++                    p->spdif_out[out + 2], p->spdif_out[out + 3]);
++            p->spdif_dbg++;
++        }
 +        out += payload;
 +        i += 8 + payload; // padding (zeros) up to the next sync is skipped by the scan above
 +    }
@@ -114,7 +122,7 @@ index f483ccc..e56d2f4 100644
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -495,7 +558,25 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -495,7 +566,25 @@ static int AudioTrack_write(struct ao *ao, int len)
      void *buf = p->chunk;
  
      jint ret;
@@ -141,7 +149,7 @@ index f483ccc..e56d2f4 100644
          (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
          if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
          ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
-@@ -636,6 +717,8 @@ static void uninit(struct ao *ao)
+@@ -636,6 +725,8 @@ static void uninit(struct ao *ao)
  
      MP_JNI_GLOBAL_FREEP(&p->bbuf);
  
@@ -150,7 +158,7 @@ index f483ccc..e56d2f4 100644
      MP_JNI_GLOBAL_FREEP(&p->timestamp);
  
      mp_cond_destroy(&p->wakeup);
-@@ -658,11 +741,29 @@ static int init(struct ao *ao)
+@@ -658,11 +749,29 @@ static int init(struct ao *ao)
          return -1;
  
      if (af_fmt_is_spdif(ao->format)) {
@@ -182,7 +190,7 @@ index f483ccc..e56d2f4 100644
      } else if (ao->format == AF_FORMAT_U8) {
          p->format = AudioFormat.ENCODING_PCM_8BIT;
      } else if (p->cfg_pcm_float && af_fmt_is_float(ao->format)) {
-@@ -673,7 +774,8 @@ static int init(struct ao *ao)
+@@ -673,7 +782,8 @@ static int init(struct ao *ao)
          p->format = AudioFormat.ENCODING_PCM_16BIT;
      }
  
@@ -192,7 +200,7 @@ index f483ccc..e56d2f4 100644
          jint samplerate = MP_JNI_CALL_STATIC_INT(
              AudioTrack.clazz,
              AudioTrack.getNativeOutputSampleRate,
-@@ -685,6 +787,29 @@ static int init(struct ao *ao)
+@@ -685,6 +795,29 @@ static int init(struct ao *ao)
          }
      }
      p->samplerate = ao->samplerate;
@@ -222,7 +230,7 @@ index f483ccc..e56d2f4 100644
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -710,7 +835,8 @@ static int init(struct ao *ao)
+@@ -710,7 +843,8 @@ static int init(struct ao *ao)
          AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
      };
      static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
@@ -232,7 +240,7 @@ index f483ccc..e56d2f4 100644
          p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
      } else {
          struct mp_chmap_sel sel = {0};
-@@ -759,6 +885,17 @@ static int init(struct ao *ao)
+@@ -759,6 +893,17 @@ static int init(struct ao *ao)
      p->timestamp = (*env)->NewGlobalRef(env, timestamp);
      MP_JNI_LOCAL_FREEP(&timestamp);
  
